@@ -20,6 +20,59 @@ import time
 from typing import Optional
 
 import cv2
+import numpy as np
+from tkinter import messagebox
+
+
+def gaussian_kernel1d(sigma: float, radius: Optional[int] = None) -> np.ndarray:
+    """Create a 1-D Gaussian kernel with given sigma. If radius is None use 3*sigma."""
+    if sigma <= 0:
+        return np.array([1.0], dtype=np.float32)
+    if radius is None:
+        radius = int(max(1, math.ceil(3.0 * sigma)))
+    x = np.arange(-radius, radius + 1, dtype=np.float32)
+    g = np.exp(-(x * x) / (2.0 * sigma * sigma))
+    g /= g.sum()
+    return g.astype(np.float32)
+
+
+def gaussian_blur(image: np.ndarray, sigma: float) -> np.ndarray:
+    """Apply a separable Gaussian blur to a 2D or 3D image using numpy only.
+
+    This uses np.convolve along rows and columns with a 1-D kernel.
+    """
+    if sigma <= 0 or image is None:
+        return image.copy()
+
+    kernel = gaussian_kernel1d(sigma)
+
+    # work on float for accuracy
+    arr = image.astype(np.float32)
+    if arr.ndim == 2:
+        # rows then cols
+        tmp = np.apply_along_axis(lambda m: np.convolve(m, kernel, mode='same'), axis=1, arr=arr)
+        out = np.apply_along_axis(lambda m: np.convolve(m, kernel, mode='same'), axis=0, arr=tmp)
+        return np.clip(out, 0, 255).astype(image.dtype)
+
+    # color image
+    out = np.empty_like(arr)
+    for c in range(arr.shape[2]):
+        channel = arr[:, :, c]
+        tmp = np.apply_along_axis(lambda m: np.convolve(m, kernel, mode='same'), axis=1, arr=channel)
+        filtered = np.apply_along_axis(lambda m: np.convolve(m, kernel, mode='same'), axis=0, arr=tmp)
+        out[:, :, c] = filtered
+
+    return np.clip(out, 0, 255).astype(image.dtype)
+
+
+def absdiff_numpy(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Compute per-element absolute difference between two images using numpy."""
+    # cast to int32 to avoid overflow then take abs
+    ai = a.astype(np.int32)
+    bi = b.astype(np.int32)
+    diff = np.abs(ai - bi)
+    return np.clip(diff, 0, 255).astype(np.uint8)
+
 import tkinter as tk
 from tkinter import ttk
 try:
@@ -56,10 +109,8 @@ def get_video_capture(index: int = 0) -> Optional[cv2.VideoCapture]:
                 return cap
             cap.release()
         except Exception:
-            # Some builds may not support specific backend constants
+        
             continue
-
-    # Fallback: try opening without explicit backend
     try:
         cap = cv2.VideoCapture(index)
         if cap is not None and cap.isOpened():
@@ -131,7 +182,7 @@ def main() -> int:
         return 3
 
     try:
-        # Warm up a little
+
         warm_frames = 5
         for _ in range(warm_frames):
             cap.read()
@@ -153,14 +204,13 @@ def main() -> int:
             now = time.time()
             seconds_left = max(0, int(math.ceil(end - now)))
 
-            # Overlay countdown only while > 0
+       
             if seconds_left > 0:
                 overlay_countdown(frame, seconds_left)
 
             if not args.no_window:
                 cv2.imshow(window_name, frame)
 
-            # If time's up capture and break
             if now >= end:
                 captured_frame = frame.copy()
                 if not args.quiet:
@@ -241,7 +291,10 @@ class CameraApp:
         ttk.Label(self.root, text="Base name:").grid(row=1, column=0, sticky='e')
         self.name_var = tk.StringVar(value="photo")
         self.name_entry = ttk.Entry(self.root, textvariable=self.name_var, width=30)
-        self.name_entry.grid(row=1, column=1, columnspan=3, sticky='w')
+        self.name_entry.grid(row=1, column=1, columnspan=2, sticky='w')
+        # Background button
+        self.bg_button = ttk.Button(self.root, text="Take background", command=self.take_background)
+        self.bg_button.grid(row=1, column=3)
 
         ttk.Label(self.root, text="Timer (s):").grid(row=2, column=0, sticky='e')
         self.timer_var = tk.DoubleVar(value=3.0)
@@ -259,6 +312,13 @@ class CameraApp:
 
         # For displaying the latest frame
         self.photo_image = None
+
+        # Background storage (temporary)
+        self.background = None
+        self.bg_running = False
+        self.bg_countdown_end = 0.0
+        self.bg_burst_count = 10
+        self.bg_captured = False
 
         # Handle window close
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -314,15 +374,15 @@ class CameraApp:
         self.status_var.set("Stopped")
 
     def _save_frame(self, frame) -> bool:
-        # Use the user-provided name. Append .jpg if missing. If file exists, append suffix.
+
         name = self.sequence_basename
-        # ensure extension
+
         if not os.path.splitext(name)[1]:
             name = name + ".jpg"
 
         filename = name
         if os.path.exists(filename):
-            # find a non-colliding name
+   
             i = 1
             base_no_ext = os.path.splitext(name)[0]
             ext = os.path.splitext(name)[1]
@@ -337,18 +397,65 @@ class CameraApp:
             saved = cv2.imwrite(filename, frame)
             if saved:
                 self.status_var.set(f"Saved {filename}")
+                return filename
             else:
                 self.status_var.set(f"Failed to save {filename}")
-            return saved
+                return None
         except Exception as e:
             self.status_var.set(f"Error saving {filename}: {e}")
-            return False
+            return None
+
+    def take_background(self):
+
+        if self.bg_running or self.sequence_running:
+            self.status_var.set("Busy: finish current action first")
+            return
+
+        ok = messagebox.askokcancel("Take background", "Make sure you are outside the camera area. Click OK to start a 5s countdown.")
+        if not ok:
+            return
+
+        self.bg_running = True
+        self.bg_countdown_end = time.time() + 5.0
+        self.bg_captured = False
+        self.status_var.set("Starting background countdown...")
 
     def _update_frame(self):
         ret, frame = self.cap.read()
         if ret and frame is not None:
             now = time.time()
-            # Handle sequence/countdown state
+   
+            if self.bg_running:
+                seconds_left = max(0, int(math.ceil(self.bg_countdown_end - now)))
+                if seconds_left > 0:
+                    overlay_countdown(frame, seconds_left)
+                else:
+                    if not self.bg_captured:
+               
+                        self.status_var.set("Capturing background burst...")
+                        n = max(3, int(self.bg_burst_count))
+                        acc = np.zeros_like(frame, dtype=np.float32)
+                        captured = 0
+                        for i in range(n):
+                            r, f = self.cap.read()
+                            if not r or f is None:
+                                time.sleep(0.02)
+                                continue
+                            acc += f.astype(np.float32)
+                            captured += 1
+                            time.sleep(0.03)
+                        if captured > 0:
+                            avg = (acc / float(captured)).astype(np.uint8)
+                            self.background = avg
+                            self.bg_captured = True
+                            self.bg_running = False
+                            self.status_var.set("Background captured")
+                        else:
+                            self.status_var.set("Failed to capture background")
+                            self.bg_running = False
+                            self.bg_captured = False
+
+
             if self.sequence_running:
                 # countdown in progress for a single capture
                 seconds_left = max(0, int(math.ceil(self.countdown_end_time - now)))
@@ -357,12 +464,20 @@ class CameraApp:
                 else:
                     if not self.captured_this_step:
                         self.status_var.set("Capturing...")
-                        self._save_frame(frame.copy())
+                        saved = self._save_frame(frame.copy())
                         self.captured_this_step = True
                         self.sequence_running = False
                         self.start_button.config(state='normal')
                         self.stop_button.config(state='disabled')
-                        self.status_var.set("Capture complete")
+                        if saved and self.background is not None:
+                            # perform subtraction and save results
+                            try:
+                                self._process_subtraction(frame.copy(), saved)
+                                self.status_var.set("Capture and subtraction complete")
+                            except Exception as e:
+                                self.status_var.set(f"Subtraction failed: {e}")
+                        else:
+                            self.status_var.set("Capture complete")
 
             # Convert BGR to RGB for Tkinter display
             try:
@@ -377,6 +492,38 @@ class CameraApp:
 
         # schedule next frame update
         self.root.after(30, self._update_frame)
+
+    def _process_subtraction(self, frame, saved_filename: str) -> None:
+        """Perform background subtraction using the stored background and save the masked region and mask."""
+        if self.background is None:
+            raise RuntimeError("No background set")
+
+        # Ensure same size
+        bg = self.background
+        if bg.shape[:2] != frame.shape[:2]:
+            # resize background to match frame
+            bg = cv2.resize(bg, (frame.shape[1], frame.shape[0]))
+
+        # Use numpy-based absolute difference and gaussian blur
+        diff = absdiff_numpy(frame, bg)
+        gray = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
+        # apply small gaussian blur implemented above
+        blur = gaussian_blur(gray, sigma=1.5)
+        _, mask = cv2.threshold(blur, 30, 255, cv2.THRESH_BINARY)
+
+        # clean small noise
+        kernel = np.ones((3, 3), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+        mask = cv2.dilate(mask, kernel, iterations=1)
+
+        masked_color = cv2.bitwise_and(frame, frame, mask=mask)
+
+        base = os.path.splitext(saved_filename)[0]
+        fg_name = f"{base}_fg.png"
+        mask_name = f"{base}_mask.png"
+
+        cv2.imwrite(fg_name, masked_color)
+        cv2.imwrite(mask_name, mask)
 
 
 if __name__ == '__main__':
