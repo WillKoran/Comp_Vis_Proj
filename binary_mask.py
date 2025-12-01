@@ -19,8 +19,8 @@ def create_binary_mask(image_path, background_path, threshold):
 
     return binary_mask
 
-binary_mask = create_binary_mask('IMG_0022.jpeg', 'IMG_0002.jpeg', threshold=0.3)
-io.imsave('binary_mask2.jpeg', img_as_ubyte(binary_mask))
+binary_mask = create_binary_mask('testing_binary_images/IMG_4.jpg', 'testing_binary_images/IMG_0.jpg', threshold=0.4)
+io.imsave('binary_masks/binary_mask4.jpeg', img_as_ubyte(binary_mask))
 
 
 
