@@ -22,6 +22,9 @@ from typing import Optional
 import cv2
 import numpy as np
 from tkinter import messagebox, filedialog
+import random
+import re
+import threading
 
 
 def gaussian_kernel1d(sigma: float, radius: Optional[int] = None) -> np.ndarray:
@@ -305,6 +308,10 @@ class CameraApp:
         self.start_button.grid(row=2, column=2)
         self.stop_button = ttk.Button(self.root, text="Stop", command=self.stop_sequence, state='disabled')
         self.stop_button.grid(row=2, column=3)
+        # MHI button: capture short burst and build a motion history image
+        # MHI button is disabled until a background is captured
+        self.mhi_button = ttk.Button(self.root, text="Take MHI", command=self.take_mhi, state='disabled')
+        self.mhi_button.grid(row=2, column=4)
 
         self.status_var = tk.StringVar(value="Ready")
         self.status_label = ttk.Label(self.root, textvariable=self.status_var)
@@ -313,12 +320,32 @@ class CameraApp:
         # For displaying the latest frame
         self.photo_image = None
 
+        # Game score
+        self.score_count = 0
+
+        # Score label (top-right)
+        self.score_var = tk.StringVar(value=f"Score: {self.score_count}")
+        self.score_label = ttk.Label(self.root, textvariable=self.score_var, background='yellow')
+        # place so it overlays top-right of window
+        self.score_label.place(relx=0.98, rely=0.02, anchor='ne')
+
         # Background storage (temporary)
         self.background = None
         self.bg_running = False
         self.bg_countdown_end = 0.0
         self.bg_burst_count = 10
         self.bg_captured = False
+
+        # MHI state
+        self.mhi_running = False
+        self.mhi_countdown_end = 0.0
+        self.mhi_captured = False
+
+        # Final-level MHI game state
+        self.final_level_active = False
+        self.final_mhi_target = None
+        self.final_mhi_filename = None
+        self.final_mhi_index = None
 
         # Handle window close
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -362,6 +389,23 @@ class CameraApp:
         self.start_button.config(state='disabled')
         self.stop_button.config(state='normal')
         self.status_var.set("Starting countdown")
+
+        # If final level is active, pressing Start should trigger the MHI countdown
+        if getattr(self, 'final_level_active', False):
+            # cancel the normal photo capture and start MHI countdown instead
+            self.sequence_running = False
+            self.captured_this_step = False
+            self.countdown_end_time = 0.0
+            self.stop_button.config(state='disabled')
+            # start MHI countdown using same timer value
+            self.mhi_running = True
+            self.mhi_countdown_end = time.time() + float(self.timer_var.get())
+            self.mhi_captured = False
+            try:
+                self.mhi_button.config(state='disabled')
+            except Exception:
+                pass
+            self.status_var.set("Starting Final-Level MHI countdown...")
 
     def stop_sequence(self):
         if not self.sequence_running:
@@ -420,141 +464,247 @@ class CameraApp:
         self.bg_captured = False
         self.status_var.set("Starting background countdown...")
 
-    def capture_reference_and_start_game(self):
-        """Capture a reference (O-photo), compute its mask, display it, and enable game mode."""
-        # Capture a small burst and average to reduce noise
-        n = 3
-        acc = None
-        captured = 0
-        for i in range(n):
-            r, f = self.cap.read()
-            if not r or f is None:
-                time.sleep(0.05)
-                continue
-            if acc is None:
-                acc = f.astype(np.float32)
-            else:
-                acc += f.astype(np.float32)
-            captured += 1
-            time.sleep(0.05)
+    def take_mhi(self):
+        """Start capture of a short burst to build an MHI (60 frames over 2 seconds).
 
-        if captured == 0:
-            raise RuntimeError("Failed to capture reference frame")
-
-        ref = (acc / float(captured)).astype(np.uint8)
-        # Save reference image as O-photo.jpg (avoid overwriting existing)
-        ref_name = 'O-photo.jpg'
-        if os.path.exists(ref_name):
-            i = 1
-            base, ext = os.path.splitext(ref_name)
-            while True:
-                candidate = f"{base}_{i}{ext}"
-                if not os.path.exists(candidate):
-                    ref_name = candidate
-                    break
-                i += 1
-        cv2.imwrite(ref_name, ref)
-
-        # compute mask and save files via _process_subtraction
-        mask, fg_name, mask_name = self._process_subtraction(ref, ref_name)
-        # store target mask for scoring
-        self.target_mask = mask
-        self.game_active = True
-        self.target_ref_name = ref_name
-        self.target_mask_name = mask_name
-        # display the reference and mask to the user
-        self._show_target_window(ref, mask)
-
-    def choose_existing_reference(self):
-        """Let the user pick an existing O-photo image and load its mask if available.
-
-        If a mask file is not found, ask whether to compute a mask from the background.
+        Starts a GUI countdown (so the player can get into position). The actual
+        capture runs in a background thread. Segmentation uses the stored
+        background and the same processing pipeline as timer captures.
         """
-        fn = filedialog.askopenfilename(title="Select O-photo image", filetypes=[("Image files", "*.jpg;*.jpeg;*.png;*.bmp;*.tif;*.tiff" )], initialdir='.')
-        if not fn:
-            self.status_var.set("No reference chosen")
+        if self.bg_running or self.sequence_running:
+            self.status_var.set("Busy: finish current action first")
             return
 
-        # try to find mask candidates
-        base, ext = os.path.splitext(fn)
-        candidates = [f"{base}_mask.png", f"{base}_mask.jpg", f"{base}_mask.jpeg", f"{base}_mask.bmp", f"{base}_mask.tif"]
-        mask_path = None
-        for c in candidates:
-            if os.path.exists(c):
-                mask_path = c
-                break
+        if self.background is None:
+            ask = messagebox.askyesno("Background required", "No background captured. Take background now?")
+            if ask:
+                # start background capture flow
+                self.take_background()
+            else:
+                self.status_var.set("Background required for MHI")
+            return
 
-        # load reference image
-        ref = cv2.imread(fn)
-        if ref is None:
-            raise RuntimeError("Failed to read selected reference image")
+        # start a countdown using the shared timer value so the user can get in position
+        self.mhi_running = True
+        self.mhi_countdown_end = time.time() + float(self.timer_var.get())
+        self.mhi_captured = False
+        try:
+            self.mhi_button.config(state='disabled')
+        except Exception:
+            pass
+        self.status_var.set("Starting MHI countdown...")
 
-        if mask_path and os.path.exists(mask_path):
-            mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
-            if mask is None:
-                # fallback to computing mask
-                compute = messagebox.askyesno("Mask not readable", "Found mask file but couldn't read it. Compute mask from background instead?")
-                if not compute:
-                    self.status_var.set("No usable mask found")
-                    return
-                mask, _, _ = self._process_subtraction(ref, fn)
-        else:
-            # no mask file found
-            compute = messagebox.askyesno("No mask found", "No mask file found for selected O-photo. Compute mask from background? (Requires background to be set)")
-            if not compute:
-                self.status_var.set("No mask available for reference")
-                return
-            if self.background is None:
-                raise RuntimeError("Background not set; cannot compute mask for reference")
-            mask, _, _ = self._process_subtraction(ref, fn)
+    def _capture_mhi_worker(self):
+        try:
+            self.status_var.set("Capturing MHI burst...")
+            # Target 60 frames over ~2 seconds to capture motion more fully
+            n = 60
+            duration = 2.0
+            interval = duration / float(n)
 
-        # store and activate game
-        self.target_mask = mask
-        self.game_active = True
-        self.target_ref_name = fn
-        self.target_mask_name = mask_path if mask_path else f"{os.path.splitext(fn)[0]}_mask.png"
-        self._show_target_window(ref, mask)
+            # warm camera with a few reads
+            for _ in range(4):
+                self.cap.read()
 
-    def choose_existing_reference_preselected(self, path: str):
-        """Load a specific existing O-photo (path) and its mask if available.
+            frames = []
+            start_ts = time.perf_counter()
+            for i in range(n):
+                # target time for this frame
+                target = start_ts + i * interval
+                r, f = self.cap.read()
+                if not r or f is None:
+                    if len(frames) > 0:
+                        frames.append(frames[-1].copy())
+                    else:
+                        # create a placeholder matching expected frame size if possible
+                        frames.append(np.zeros((480, 640, 3), dtype=np.uint8))
+                else:
+                    frames.append(f.copy())
 
-        This is like `choose_existing_reference` but accepts a preselected path.
+                # wait until the next target time (use perf_counter for accuracy)
+                now = time.perf_counter()
+                sleep_for = target + interval - now
+                if sleep_for > 0:
+                    time.sleep(sleep_for)
+
+            # segmentation per frame
+            masks = []
+            kernel = np.ones((3, 3), np.uint8)
+            if self.background is not None:
+                # ensure size match
+                bg = self.background
+                if bg.shape[:2] != frames[0].shape[:2]:
+                    bg = cv2.resize(bg, (frames[0].shape[1], frames[0].shape[0]))
+                for f in frames:
+                    diff = absdiff_numpy(f, bg)
+                    gray = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
+                    blur = gaussian_blur(gray, sigma=1.0)
+                    _, mask = cv2.threshold(blur, 25, 255, cv2.THRESH_BINARY)
+                    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+                    mask = cv2.dilate(mask, kernel, iterations=1)
+                    masks.append(mask)
+            else:
+                # frame differencing
+                prev_gray = cv2.cvtColor(frames[0], cv2.COLOR_BGR2GRAY)
+                masks.append(np.zeros_like(prev_gray))
+                for f in frames[1:]:
+                    g = cv2.cvtColor(f, cv2.COLOR_BGR2GRAY)
+                    diff = cv2.absdiff(g, prev_gray)
+                    blur = gaussian_blur(diff, sigma=1.0)
+                    _, mask = cv2.threshold(blur, 20, 255, cv2.THRESH_BINARY)
+                    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+                    mask = cv2.dilate(mask, kernel, iterations=1)
+                    masks.append(mask)
+                    prev_gray = g
+
+            # construct motion history image (MHI)
+            if not masks:
+                raise RuntimeError("No masks generated for MHI")
+
+            h, w = masks[0].shape[:2]
+            mhi = np.zeros((h, w), dtype=np.float32)
+            tau = float(len(masks))
+            for mask in masks:
+                motion = (mask > 0).astype(np.float32)
+                # set recent motion to tau, decay older motion by 1
+                mhi = np.where(motion > 0, tau, np.maximum(0.0, mhi - 1.0))
+
+            # normalize to 0-255 uint8
+            mhi_norm = np.clip((mhi / tau) * 255.0, 0, 255).astype(np.uint8)
+
+            # save file
+            base = self.sequence_basename or 'mhi'
+            if not os.path.splitext(base)[1]:
+                base = base + ""
+            fname = f"{base}_mhi.png"
+            if os.path.exists(fname):
+                i = 1
+                base_no_ext = os.path.splitext(fname)[0]
+                while True:
+                    candidate = f"{base_no_ext}_{i}.png"
+                    if not os.path.exists(candidate):
+                        fname = candidate
+                        break
+                    i += 1
+
+            cv2.imwrite(fname, mhi_norm)
+            # Schedule UI updates on the main thread so Tkinter calls are safe
+            def _on_mhi_complete():
+                try:
+                    # If this is the final-level attempt, perform comparison to target
+                    if getattr(self, 'final_level_active', False) and self.final_mhi_target is not None:
+                        try:
+                            target = self.final_mhi_target
+                            _, tgt_bin = cv2.threshold(target, 127, 255, cv2.THRESH_BINARY)
+                            _, att_bin = cv2.threshold(mhi_norm, 127, 255, cv2.THRESH_BINARY)
+                            if tgt_bin.shape != att_bin.shape:
+                                att_bin = cv2.resize(att_bin, (tgt_bin.shape[1], tgt_bin.shape[0]), interpolation=cv2.INTER_NEAREST)
+                            inter = np.logical_and(tgt_bin > 0, att_bin > 0).sum()
+                            union = np.logical_or(tgt_bin > 0, att_bin > 0).sum()
+                            score = 0.0 if union == 0 else float(inter) / float(union) * 100.0
+                            if score >= 65.0:
+                                self.score_count += 2
+                                self.score_var.set(f"Score: {self.score_count}")
+                                self.final_level_active = False
+                                self.status_var.set("Final level complete — you won!")
+                                messagebox.showinfo("Final level", f"Final MHI match: {score:.1f}% — You earned 2 points!")
+                            else:
+                                messagebox.showinfo("Final level", f"Final MHI match: {score:.1f}% — below threshold, try again.")
+                                try:
+                                    self._select_and_show_final_mhi_target()
+                                    self.status_var.set("Try the next final-level MHI target and press Start")
+                                except Exception as e:
+                                    self.final_level_active = False
+                                    self.status_var.set(f"Failed to load next final target: {e}")
+                                    messagebox.showerror("Final level error", f"Failed to load next final target: {e}")
+                        except Exception as e:
+                            self.status_var.set(f"Final-level scoring failed: {e}")
+                            messagebox.showerror("Final level error", f"Scoring failed: {e}")
+                    else:
+                        self.status_var.set(f"MHI saved to {fname}")
+                        messagebox.showinfo("MHI", f"Saved MHI to {fname}")
+
+                finally:
+                    # Re-enable the MHI button (allow multiple captures without retaking background)
+                    try:
+                        self.mhi_button.config(state='normal')
+                    except Exception:
+                        pass
+
+            try:
+                self.root.after(0, _on_mhi_complete)
+            except Exception:
+                # fallback if root isn't available; try direct calls
+                _on_mhi_complete()
+        except Exception as e:
+            self.status_var.set(f"MHI capture failed: {e}")
+            messagebox.showerror("MHI Error", f"Failed to create MHI: {e}")
+
+    # Removed manual reference capture flow: the app now relies solely on
+    # templates in `./templates` (match_me_#.png with corresponding masks).
+
+    def start_template_game(self):
+        """Pick a random template from ./templates and set it as the target for the game.
+
+        Templates expected: `templates/match_me_#.png` and `templates/match_me_#_mask.png` (# in 0..5).
         """
-        if not path or not os.path.exists(path):
-            raise RuntimeError("Provided reference path does not exist")
+        tpl_dir = os.path.join(os.getcwd(), 'templates')
+        if not os.path.isdir(tpl_dir):
+            raise RuntimeError("templates directory not found")
 
-        fn = path
-        # try to find mask candidates
-        base, ext = os.path.splitext(fn)
-        candidates = [f"{base}_mask.png", f"{base}_mask.jpg", f"{base}_mask.jpeg", f"{base}_mask.bmp", f"{base}_mask.tif"]
-        mask_path = None
-        for c in candidates:
-            if os.path.exists(c):
-                mask_path = c
-                break
+        # find match_me_#.png files
+        files = os.listdir(tpl_dir)
+        pattern = re.compile(r'^match_me_(\d+)\.jpg$', re.IGNORECASE)
+        candidates = []
+        for fn in files:
+            m = pattern.match(fn)
+            if m:
+                candidates.append((int(m.group(1)), os.path.join(tpl_dir, fn)))
 
-        ref = cv2.imread(fn)
-        if ref is None:
-            raise RuntimeError("Failed to read reference image")
+        if not candidates:
+            raise RuntimeError("No match_me_#.png templates found in templates/")
 
-        if mask_path and os.path.exists(mask_path):
-            mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
-            if mask is None:
-                # compute if unreadable
-                mask, _, _ = self._process_subtraction(ref, fn)
-        else:
-            if self.background is None:
-                raise RuntimeError("Background not set; cannot compute mask for reference")
-            mask, _, _ = self._process_subtraction(ref, fn)
+        idx, chosen = random.choice(candidates)
+        mask_name = os.path.join(tpl_dir, f"match_me_{idx}_mask.png")
+        img = cv2.imread(chosen)
+        if img is None:
+            raise RuntimeError(f"Failed to read template {chosen}")
+        if not os.path.exists(mask_name):
+            raise RuntimeError(f"Mask not found for template {chosen}")
 
-        self.target_mask = mask
+        mask = cv2.imread(mask_name, cv2.IMREAD_GRAYSCALE)
+        if mask is None:
+            raise RuntimeError(f"Failed to read mask {mask_name}")
+
+        # ensure binary
+        _, mask_bin = cv2.threshold(mask, 127, 255, cv2.THRESH_BINARY)
+
+        self.target_mask = mask_bin
         self.game_active = True
-        self.target_ref_name = fn
-        self.target_mask_name = mask_path if mask_path else f"{base}_mask.png"
-        self._show_target_window(ref, mask)
+        self.target_ref_name = chosen
+        self.target_mask_name = mask_name
+        self._show_target_window(img, mask_bin)
+
+    def start_final_level(self):
+        """Initialize and show the first final-level MHI target, and set final level active."""
+        # verify background available
+        if self.background is None:
+            raise RuntimeError("Background must be set before starting final level")
+
+        # mark final level active
+        self.final_level_active = True
+        # select and show target
+        self._select_and_show_final_mhi_target()
+        self.status_var.set("Final level started: press Start to capture MHI")
+
+    # Removed choose_existing_reference: manual external reference selection
+    # is no longer supported. The app uses templates in `./templates` only.
+
+    # Removed choose_existing_reference_preselected: no longer using external
+    # manual reference files.
 
     def _show_target_window(self, image, mask):
-        """Show a small window with the reference image and overlayed mask outline."""
+        """Show a small window with the reference image and overlayed mask outline (templates only)."""
         try:
             img_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
             pil_img = Image.fromarray(img_rgb)
@@ -565,7 +715,7 @@ class CameraApp:
             overlay = Image.blend(pil_img, pil_mask, alpha=0.4)
 
             win = tk.Toplevel(self.root)
-            win.title('Target (O-photo)')
+            win.title('Target')
             tk_img = ImageTk.PhotoImage(overlay)
             lbl = ttk.Label(win, image=tk_img)
             lbl.image = tk_img
@@ -573,6 +723,64 @@ class CameraApp:
             ttk.Label(win, text='Match this outline and then press Start to capture').pack()
         except Exception as e:
             self.status_var.set(f"Failed to show target: {e}")
+
+    def _show_mhi_target_window(self, mhi_image: np.ndarray):
+        """Show a small window with the target MHI image for the final level."""
+        try:
+            # mhi_image is grayscale 0-255; convert to RGB for display
+            if mhi_image.ndim == 2:
+                cmap = cv2.applyColorMap(mhi_image, cv2.COLORMAP_JET)
+            else:
+                # if already 3-channel
+                cmap = mhi_image
+            img_rgb = cv2.cvtColor(cmap, cv2.COLOR_BGR2RGB)
+            pil_img = Image.fromarray(img_rgb)
+
+            win = tk.Toplevel(self.root)
+            win.title(f'Final MHI Target: {self.final_mhi_filename}')
+            tk_img = ImageTk.PhotoImage(pil_img)
+            lbl = ttk.Label(win, image=tk_img)
+            lbl.image = tk_img
+            lbl.pack()
+            ttk.Label(win, text='Try to reproduce this motion history. Press Start when ready.').pack()
+        except Exception as e:
+            self.status_var.set(f"Failed to show MHI target: {e}")
+
+    def _select_and_show_final_mhi_target(self):
+        """Randomly pick photo_mhi_0.png or photo_mhi_1.png (search cwd and templates/) and show it."""
+        candidates = []
+        for base in ['photo_mhi_0.png', 'photo_mhi_1.png']:
+            if os.path.exists(base):
+                candidates.append(base)
+        tpl_dir = os.path.join(os.getcwd(), 'templates')
+        if os.path.isdir(tpl_dir):
+            for base in ['photo_mhi_0.png', 'photo_mhi_1.png']:
+                p = os.path.join(tpl_dir, base)
+                if os.path.exists(p):
+                    candidates.append(p)
+
+        if not candidates:
+            raise RuntimeError("No final-level MHI files found (photo_mhi_0.png or photo_mhi_1.png)")
+
+        chosen = random.choice(candidates)
+        mhi = cv2.imread(chosen, cv2.IMREAD_GRAYSCALE)
+        if mhi is None:
+            raise RuntimeError(f"Failed to read final-level MHI file {chosen}")
+
+        self.final_mhi_target = mhi
+        self.final_mhi_filename = os.path.basename(chosen)
+        # set index 0 or 1 when possible
+        m = re.search(r'photo_mhi_(\d)\.png$', self.final_mhi_filename)
+        if m:
+            try:
+                self.final_mhi_index = int(m.group(1))
+            except Exception:
+                self.final_mhi_index = None
+        else:
+            self.final_mhi_index = None
+
+        # show target to the player
+        self._show_mhi_target_window(mhi)
 
     def _compare_masks(self, target_mask: np.ndarray, attempt_mask: np.ndarray) -> float:
         """Compute IoU between target and attempt masks after centroid alignment.
@@ -675,36 +883,27 @@ class CameraApp:
                             self.background = avg
                             self.bg_captured = True
                             self.bg_running = False
+                            # Enable MHI button now that a background exists
+                            try:
+                                self.mhi_button.config(state='normal')
+                            except Exception:
+                                pass
                             self.status_var.set("Background captured")
                             # After background is captured, offer to play
                             play = messagebox.askyesno("Play?", "Background captured. Would you like to play the matching game?")
                             if play:
-                                # Auto-load O-photo if present in working directory
-                                candidates = ['O-photo.jpg', 'O-photo.jpeg', 'O-photo.png', 'O-photo.bmp', 'O-photo.tif']
-                                found = None
-                                for c in candidates:
-                                    if os.path.exists(c):
-                                        found = c
-                                        break
-                                if found:
+                                # Use templates only: look for ./templates/match_me_#.png
+                                tpl_dir = os.path.join(os.getcwd(), 'templates')
+                                if os.path.isdir(tpl_dir):
                                     try:
-                                        # Load the existing reference directly
-                                        self.choose_existing_reference_preselected(found)
+                                        self.start_template_game()
                                     except Exception as e:
-                                        self.status_var.set(f"Failed to load O-photo: {e}")
+                                        self.status_var.set(f"Failed to start template game: {e}")
+                                        messagebox.showerror("Template Error", f"Failed to start template game: {e}")
                                 else:
-                                    # No auto O-photo found: ask user whether to pick or capture
-                                    use_existing = messagebox.askyesno("Reference", "No O-photo found automatically. Pick an existing file? (Yes = choose file, No = capture new reference)")
-                                    if use_existing:
-                                        try:
-                                            self.choose_existing_reference()
-                                        except Exception as e:
-                                            self.status_var.set(f"Failed to load existing reference: {e}")
-                                    else:
-                                        try:
-                                            self.capture_reference_and_start_game()
-                                        except Exception as e:
-                                            self.status_var.set(f"Failed to start game: {e}")
+                                    # Do not fallback to external reference files. Inform the user.
+                                    self.status_var.set("No templates directory found (./templates)")
+                                    messagebox.showerror("Templates missing", "No templates found in ./templates. Add 'match_me_#.png' and 'match_me_#_mask.png' files to play the matching game.")
                             else:
                                 # ask to retake or quit
                                 retake = messagebox.askyesno("Background set", "Do you want to retake the background? (Yes = retake, No = keep background)")
@@ -716,6 +915,20 @@ class CameraApp:
                             self.bg_running = False
                             self.bg_captured = False
 
+
+            if self.mhi_running:
+                seconds_left = max(0, int(math.ceil(self.mhi_countdown_end - now)))
+                if seconds_left > 0:
+                    overlay_countdown(frame, seconds_left)
+                else:
+                    if not self.mhi_captured:
+                        # start MHI worker in background
+                        try:
+                            threading.Thread(target=self._capture_mhi_worker, daemon=True).start()
+                        except Exception:
+                            pass
+                        self.mhi_captured = True
+                        self.mhi_running = False
 
             if self.sequence_running:
                 # countdown in progress for a single capture
@@ -739,7 +952,46 @@ class CameraApp:
                                                 if getattr(self, 'game_active', False) and hasattr(self, 'target_mask') and self.target_mask is not None:
                                                     try:
                                                         score = self._compare_masks(self.target_mask, mask)
-                                                        messagebox.showinfo("Score", f"Match score: {score:.1f}%")
+                                                        awarded = False
+                                                        # award point if >=75%
+                                                        if score >= 70.0:
+                                                            self.score_count += 1
+                                                            self.score_var.set(f"Score: {self.score_count}")
+                                                            awarded = True
+                                                            messagebox.showinfo("Score", f"Match score: {score:.1f}% — Good! Point awarded.")
+                                                        else:
+                                                            messagebox.showinfo("Score", f"Match score: {score:.1f}%")
+
+                                                        # Check for game end (3 points)
+                                                        if self.score_count >= 3:
+                                                            # Start final MHI level instead of immediate congratulations
+                                                            self.game_active = False
+                                                            try:
+                                                                cont = messagebox.askokcancel("Final level", "Final level: Match the MHI\nAn MHI will be captured over a 2 second interval. Press OK to continue.")
+                                                            except Exception:
+                                                                cont = True
+                                                            if cont:
+                                                                # initialize final level
+                                                                try:
+                                                                    self.start_final_level()
+                                                                except Exception as e:
+                                                                    self.status_var.set(f"Failed to start final level: {e}")
+                                                                    messagebox.showerror("Final level error", f"Failed to start final level: {e}")
+                                                            else:
+                                                                # user cancelled; treat as game complete
+                                                                self.final_level_active = False
+                                                                self.status_var.set("Game complete")
+                                                        else:
+                                                            # Provide a new target template for the next attempt
+                                                            try:
+                                                                self.start_template_game()
+                                                                self.status_var.set("New target loaded. Ready for next attempt.")
+                                                            except Exception as e:
+                                                                # If templates fail to load, end game and show error
+                                                                self.game_active = False
+                                                                self.status_var.set(f"Failed to load next template: {e}")
+                                                                messagebox.showerror("Template Error", f"Failed to load next template: {e}")
+
                                                     except Exception as e:
                                                         self.status_var.set(f"Scoring failed: {e}")
                             except Exception as e:
